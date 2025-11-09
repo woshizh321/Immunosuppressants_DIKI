@@ -1,28 +1,86 @@
-# ===== A0. 环境 =====
+#=============================================================================
+# 01_general_characteristics_FAERS.R
+# General characteristics of immunosuppressant reports in FAERS (PS+SS only)
+# - Annual trend by drug class
+# - Sex distribution by drug class
+# - Age distribution (mean±SD, median [IQR]) by drug class
+# - Country/region distribution by drug class
+# =============================================================================
+
 suppressPackageStartupMessages({
-  library(DBI); library(duckdb); library(data.table); library(stringr)
+  library(DBI)
+  library(duckdb)
+  library(data.table)
+  library(stringr)
 })
 
-# ===== A1. 连接 DuckDB（内存友好）=====
-con <- dbConnect(duckdb::duckdb(), dbdir=":memory:", read_only=TRUE)
-# 不要设 threads=auto（DuckDB 需要 INT）；给个保守整数
-DBI::dbExecute(con, "PRAGMA threads=4;")
-# 适度内存上限（按机器可用内存调整）
-DBI::dbExecute(con, "PRAGMA memory_limit='8GB';")
+# ------------------------------- Configuration -------------------------------
 
-# ===== A2. 帮助函数：将 Windows 路径统一为正斜杠 =====
+# Input FAERS master parquet (case- & drug-level columns in one table)
+# Replace with your relative path in the repo:
+FAERS_FILE <- "./data/FAERS_MASTER_FILE_2004-2024_with_serious.parquet"
+
+# Output directory (relative, portable)
+OUT_DIR <- "./outputs/general"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+# Optional temp directory for DuckDB spill files (create if needed)
+DUCK_TMP <- "./.duck_tmp"
+if (!dir.exists(DUCK_TMP)) dir.create(DUCK_TMP, recursive = TRUE)
+
+# Drug-class dictionary (canonical uppercase names; can be externalized to CSV)
+drug_classes <- list(
+  "Calcineurin inhibitors" = c(
+    "TACROLIMUS","FK506","PROGRAF","ADVAGRAF",
+    "CYCLOSPORINE","NEORAL","SANDIMMUNE"
+  ),
+  "mTOR inhibitors" = c(
+    "EVEROLIMUS","AFINITOR","CERTICAN",
+    "SIROLIMUS","RAPAMUNE",
+    "TEMSIROLIMUS","TORISEL"
+  ),
+  "Antiproliferative agents" = c(
+    "MYCOPHENOLATE MOFETIL","CELLCEPT",
+    "MYCOPHENOLIC ACID","MYFORTIC",
+    "AZATHIOPRINE","IMURAN"
+  ),
+  "Corticosteroids" = c(
+    "PREDNISONE","DELTASONE",
+    "METHYLPREDNISOLONE","MEDROL","SOLU-MEDROL",
+    "DEXAMETHASONE","DECADRON","PREDNISOLONE"
+  ),
+  "Biologics" = c(
+    "RITUXIMAB","MABTHERA","RITUXAN",
+    "BASILIXIMAB","SIMULECT",
+    "BELATACEPT","NULOJIX"
+  )
+)
+
+# Candidate column names (case-insensitive); adjust if your schema differs
+CAND_COLS <- list(
+  id          = c("primaryid","primary_id","caseid","case_id","id"),
+  event_dt    = c("event_dt","eventdt","event_date","fda_dt","receiptdate"),
+  occr_ctry   = c("occr_country","occur_country","occurcountry","occrcountry"),
+  repr_ctry   = c("reporter_country","reportercountry","rpt_country"),
+  sex         = c("sex","sex_cod","patientsex"),
+  age         = c("age","age_yrs","age_years","age_val"),
+  age_cod     = c("age_cod","ageunit","age_units","ageunit_cod"),
+  role        = c("role_cod","role","drug_role","drugcharacterization"),
+  drugname    = c("drugname","medicinalproduct","prod_ai","drug_name"),
+  all_psss    = c("all_drugs_ps_ss","psss_all","drug_text_psss") # optional, pre-aggregated PS+SS text if present
+)
+
+# ------------------------------- Helper Utils --------------------------------
+
 norm_path <- function(p) gsub("\\\\", "/", p)
 
-# ===== A3. 抽取列名（得到 cols）=====
 get_cols <- function(con, parquet_path){
   sql <- sprintf("SELECT * FROM read_parquet('%s') LIMIT 0", norm_path(parquet_path))
-  df0 <- dbGetQuery(con, sql)   # 0 行但有列
+  df0 <- dbGetQuery(con, sql)
   names(df0)
 }
 
-# ===== A4. 选择列（不区分大小写，找第一个命中）=====
 pick_col <- function(cols, candidates){
-  # cols: 字符向量（实际列名）；candidates: 可能的列名集合（大小写不敏感）
   ci <- tolower(cols)
   for (cand in candidates){
     hit <- which(ci == tolower(cand))
@@ -31,127 +89,95 @@ pick_col <- function(cols, candidates){
   return(NA_character_)
 }
 
-# ===== A5. 统一把 AGE 转成年龄（岁）=====
+upper_coalesce <- function(col) sprintf("UPPER(COALESCE(%s,''))", col)
+
 age_to_years_sql <- function(age_col, age_cod_col){
-  # 生成 DuckDB SQL 片段（CASE WHEN ... END），单位换算健壮
   sprintf("
     CASE
       WHEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE) IS NULL THEN NULL
-      WHEN UPPER(COALESCE(%2$s,'')) IN ('','YR','YRS','YEAR','YEARS') THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)
-      WHEN UPPER(%2$s) IN ('MON','MONTH','MONTHS') THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)/12.0
-      WHEN UPPER(%2$s) IN ('WK','WEEK','WEEKS')   THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)/52.0
-      WHEN UPPER(%2$s) IN ('DY','DAY','DAYS')     THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)/365.25
-      WHEN UPPER(%2$s) IN ('DEC','DECADE')        THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)*10.0
+      WHEN UPPER(COALESCE(%2$s,'')) IN ('','YR','YRS','YEAR','YEARS')
+           THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)
+      WHEN UPPER(%2$s) IN ('MON','MONTH','MONTHS')
+           THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)/12.0
+      WHEN UPPER(%2$s) IN ('WK','WEEK','WEEKS')
+           THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)/52.0
+      WHEN UPPER(%2$s) IN ('DY','DAY','DAYS')
+           THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)/365.25
+      WHEN UPPER(%2$s) IN ('DEC','DECADE')
+           THEN TRY_CAST(NULLIF(CAST(%1$s AS VARCHAR), '') AS DOUBLE)*10.0
       ELSE NULL
     END
   ", age_col, age_cod_col)
 }
 
-# ===== A6. 文本字段统一大写（用于 LIKE 匹配）=====
-upper_coalesce <- function(col) sprintf("UPPER(COALESCE(%s,''))", col)
-
-# ===== A7. 关键：PS+SS 暴露来源优先级（严格口径）=====
-# 我们优先使用“已预聚合好且仅含 PS+SS 的长文本字段”（例如 ALL_DRUGS_PS_SS 或类似命名）。
-# 若不存在，则从逐药物行表中，筛选 ROLE ∈ ('PS','SS') 再聚合到病例/报告级。
-# 若两者都缺失 → 直接 QC 报错，不走 ALL_DRUGS（因为那通常含 C/I/OT，会污染 PS+SS 口径）。
-build_exposure_sql <- function(cols, dict_vec, 
-                               case_key, # 'primaryid' 或 'ID'
-                               all_drugs_psss_col = NA, # 如 'ALL_DRUGS_PS_SS'
-                               drugname_col = NA, role_col = NA){
-  # dict_vec: 某一类别的关键词（已大写）
-  like_or <- paste(sprintf("%s LIKE '%%%s%%'", "drug_blob", gsub("'", "''", toupper(dict_vec))), collapse=" OR ")
-  if (!is.na(all_drugs_psss_col)) {
-    # 直接在该字段中做 LIKE（report/case 粒度的拼接字段）
-    sql <- sprintf("
-      SELECT %1$s AS case_key,
-             CASE WHEN (%2$s) THEN 1 ELSE 0 END AS flag
-      FROM tmp_base
-    ",
-                   case_key,
-                   paste(sprintf("%s LIKE '%%%s%%'", upper_coalesce(all_drugs_psss_col), gsub("'", "''", toupper(dict_vec))), collapse=" OR ")
-    )
-    return(sql)
-  }
-  # 走逐药物行：需要 drugname_col + role_col
-  if (is.na(drugname_col) || is.na(role_col)) {
-    stop("PS+SS 口径需要：存在 ALL_DRUGS_PS_SS（或同义），或具备逐药物行的 drugname + role 列。当前两者均不可用。")
-  }
-  # 基于逐药物行构造一张“role ∈ (PS,SS) 的药物文本”子表，再按 case_key 聚合
-  # 为避免扫描多次，主流程会先构建 tmp_drugs_psss（见后续 B 段）
-  sql <- sprintf("
-    SELECT %1$s AS case_key,
-           CASE WHEN (%2$s) THEN 1 ELSE 0 END AS flag
-    FROM (
-      SELECT %1$s, STRING_AGG(%3$s, '|') AS drug_blob
-      FROM tmp_drugs_psss
-      GROUP BY %1$s
-    )
-  ",
-                 case_key,
-                 like_or,
-                 upper_coalesce(drugname_col)
-  )
-  sql
+sql_or_null_as <- function(colname, alias) {
+  if (is.na(colname)) sprintf("NULL AS %s", alias) else sprintf("%s AS %s", colname, alias)
 }
-FAERS_FILE <- "D:/FAERS/MASTER files/FAERS_MASTER_FILE_2004-2024_with_serious.parquet"
-OUT_DIR    <- "D:/FAERS/Inhibitors"; if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, TRUE)
 
-# 线程/内存/溢写
-DBI::dbExecute(con, "PRAGMA threads=2;")
-DBI::dbExecute(con, "PRAGMA memory_limit='4GB';")
-DBI::dbExecute(con, "PRAGMA temp_directory='D:/duck_tmp';")  # 先确保该目录已创建
+like_or_fun <- function(vec, col_expr){
+  paste(sprintf("%s LIKE '%%%s%%'", col_expr, gsub("'", "''", vec)), collapse = " OR ")
+}
+
+write_csv <- function(dt, path){
+  fwrite(dt, file = path, sep = ",", bom = TRUE, quote = TRUE, na = "")
+  message(">> Saved: ", path)
+}
+
+# ------------------------------- DuckDB Setup --------------------------------
+
+con <- dbConnect(duckdb::duckdb(), dbdir=":memory:", read_only=TRUE)
+DBI::dbExecute(con, "PRAGMA threads=4;")
+DBI::dbExecute(con, "PRAGMA memory_limit='8GB';")
+DBI::dbExecute(con, sprintf("PRAGMA temp_directory='%s';", norm_path(DUCK_TMP)))
 DBI::dbExecute(con, "PRAGMA preserve_insertion_order=false;")
 
+# ------------------------------- Column Binding ------------------------------
 
-# ===== B1. 基础表（FAERS） =====
+stopifnot(file.exists(FAERS_FILE))
+cols <- get_cols(con, FAERS_FILE)
 
-# 工具：缺失列 → NULL
-sql_or_null_as <- function(colname, alias) {
-  if (is.na(colname)) sprintf("NULL AS %s", alias) else colname
+col_id      <- pick_col(cols, CAND_COLS$id)
+col_eventdt <- pick_col(cols, CAND_COLS$event_dt)
+col_occr    <- pick_col(cols, CAND_COLS$occr_ctry)
+col_report  <- pick_col(cols, CAND_COLS$repr_ctry)
+col_sex     <- pick_col(cols, CAND_COLS$sex)
+col_age     <- pick_col(cols, CAND_COLS$age)
+col_agecod  <- pick_col(cols, CAND_COLS$age_cod)
+col_role    <- pick_col(cols, CAND_COLS$role)
+col_drugnm  <- pick_col(cols, CAND_COLS$drugname)
+col_alltxt  <- pick_col(cols, CAND_COLS$all_psss) # optional
+
+req <- c(col_id, col_eventdt, col_sex, col_age, col_agecod, col_role, col_drugnm)
+if (any(is.na(req))) {
+  stop("Schema binding failed. Check required columns (id/event_dt/sex/age/age_cod/role/drugname).")
 }
+
+# ------------------------------ Base Case-Level ------------------------------
 
 sql_base <- sprintf("
   CREATE OR REPLACE VIEW tmp_base AS
   SELECT
-    %s AS case_key,                       -- 主键
-    %s AS event_dt,                       -- 事件日期
-    %s,                                   -- OCCR_COUNTRY 或 NULL
-    %s,                                   -- REPORTER_COUNTRY 或 NULL
-    %s AS sex_raw,                        -- 性别
-    %s AS age_raw,                        -- 年龄
-    %s                                    -- 年龄单位/编码
+    %s AS case_key,
+    %s AS event_dt,
+    %s,
+    %s,
+    %s AS sex_raw,
+    %s AS age_raw,
+    %s AS age_cod
   FROM read_parquet('%s')
 ",
-                    col_id,
-                    col_eventdt,
-                    sql_or_null_as(col_occr,   "occr_country"),
-                    sql_or_null_as(col_report, "reporter_country"),
-                    col_sex,
-                    col_age,
-                    sql_or_null_as(col_agecod, "age_cod"),
-                    norm_path(FAERS_FILE)   # 这里用 FAERS_FILE，已经在上游定义过
+  col_id,
+  col_eventdt,
+  sql_or_null_as(col_occr,   "occr_country"),
+  sql_or_null_as(col_report, "reporter_country"),
+  col_sex,
+  col_age,
+  sql_or_null_as(col_agecod, "age_cod"),
+  norm_path(FAERS_FILE)
 )
-
 DBI::dbExecute(con, sql_base)
 
-# QC：确认 tmp_base 是否建好
-DBI::dbGetQuery(con, "PRAGMA table_info('tmp_base')")
-DBI::dbGetQuery(con, "SELECT COUNT(*) FROM tmp_base")
-# ===== B2. 构建 PS+SS 药物视图 & 年/国家代表值视图 =====
-
-# 1) 逐药物行里筛 PS/SS（仅取必要列；大小写统一）
-stopifnot(!is.na(col_drugnm), !is.na(col_role))
-DBI::dbExecute(con, sprintf("
-  CREATE OR REPLACE VIEW tmp_drugs_psss AS
-  SELECT
-    %1$s AS case_key,
-    %2$s AS drugname,
-    %3$s AS role_cod
-  FROM read_parquet('%4$s')
-  WHERE UPPER(COALESCE(%3$s,'')) IN ('PS','SS')
-", col_id, col_drugnm, col_role, norm_path(FAERS_FILE)))
-
-# 2) 从 B1 的 tmp_base 派生 year/country_use，并保留性别/年龄原始列
+# Year / country selection
 DBI::dbExecute(con, "
   CREATE OR REPLACE VIEW tmp_with_year_country AS
   SELECT
@@ -172,241 +198,213 @@ DBI::dbExecute(con, "
   FROM tmp_base
 ")
 
-# ---- QC（简短）----
-DBI::dbGetQuery(con, "SELECT COUNT(*) AS n_psss FROM tmp_drugs_psss")
-DBI::dbGetQuery(con, "SELECT COUNT(*) AS n_cases FROM tmp_with_year_country")
-DBI::dbGetQuery(con, "SELECT * FROM tmp_with_year_country WHERE year IS NOT NULL LIMIT 3")
-CNI  <- c("TACROLIMUS","FK506","PROGRAF","ADVAGRAF","CYCLOSPORINE","NEORAL","SANDIMMUNE")
-MTOR <- c("EVEROLIMUS","AFINITOR","CERTICAN","SIROLIMUS","RAPAMUNE","TEMSIROLIMUS","TORISEL")
-ANTI <- c("MYCOPHENOLATE MOFETIL","CELLCEPT","MYCOPHENOLIC ACID","MYFORTIC","AZATHIOPRINE","IMURAN")
-CS   <- c("PREDNISONE","DELTASONE","METHYLPREDNISOLONE","MEDROL","SOLU-MEDROL","DEXAMETHASONE","DECADRON","PREDNISOLONE")
-BIO  <- c("RITUXIMAB","MABTHERA","RITUXAN","BASILIXIMAB","SIMULECT","BELATACEPT","NULOJIX")
-like_or <- function(vec) paste(sprintf("UPPER(COALESCE(d.drugname,'')) LIKE '%%%s%%'", gsub("'", "''", vec)), collapse=" OR ")
+# --------------------------- PS+SS Exposure Scaffold -------------------------
+
+# 1) Filter drug rows to PS/SS only
 DBI::dbExecute(con, sprintf("
-  CREATE OR REPLACE TABLE flag_cni AS
-  SELECT DISTINCT c.case_key, 1 AS flag
-  FROM tmp_with_year_country c
-  WHERE EXISTS (SELECT 1 FROM tmp_drugs_psss d WHERE d.case_key=c.case_key AND (%s))
-", like_or(CNI)))
-
-DBI::dbExecute(con, sprintf("
-  CREATE OR REPLACE TABLE flag_mtor AS
-  SELECT DISTINCT c.case_key, 1 AS flag
-  FROM tmp_with_year_country c
-  WHERE EXISTS (SELECT 1 FROM tmp_drugs_psss d WHERE d.case_key=c.case_key AND (%s))
-", like_or(MTOR)))
-
-DBI::dbExecute(con, sprintf("
-  CREATE OR REPLACE TABLE flag_anti AS
-  SELECT DISTINCT c.case_key, 1 AS flag
-  FROM tmp_with_year_country c
-  WHERE EXISTS (SELECT 1 FROM tmp_drugs_psss d WHERE d.case_key=c.case_key AND (%s))
-", like_or(ANTI)))
-
-DBI::dbExecute(con, sprintf("
-  CREATE OR REPLACE TABLE flag_cs AS
-  SELECT DISTINCT c.case_key, 1 AS flag
-  FROM tmp_with_year_country c
-  WHERE EXISTS (SELECT 1 FROM tmp_drugs_psss d WHERE d.case_key=c.case_key AND (%s))
-", like_or(CS)))
-
-DBI::dbExecute(con, sprintf("
-  CREATE OR REPLACE TABLE flag_bio AS
-  SELECT DISTINCT c.case_key, 1 AS flag
-  FROM tmp_with_year_country c
-  WHERE EXISTS (SELECT 1 FROM tmp_drugs_psss d WHERE d.case_key=c.case_key AND (%s))
-", like_or(BIO)))
-
-# QC（每类应 >0）
-DBI::dbGetQuery(con, "SELECT (SELECT COUNT(*) FROM flag_cni) cni,
-                             (SELECT COUNT(*) FROM flag_mtor) mtor,
-                             (SELECT COUNT(*) FROM flag_anti) anti,
-                             (SELECT COUNT(*) FROM flag_cs)   cs,
-                             (SELECT COUNT(*) FROM flag_bio)  bio")
-DBI::dbGetQuery(con, "
-  SELECT 'cni'  AS cat, COUNT(*) AS n FROM flag_cni
-  UNION ALL
-  SELECT 'mtor', COUNT(*) FROM flag_mtor
-  UNION ALL
-  SELECT 'anti', COUNT(*) FROM flag_anti
-  UNION ALL
-  SELECT 'cs',   COUNT(*) FROM flag_cs
-  UNION ALL
-  SELECT 'bio',  COUNT(*) FROM flag_bio
-  ORDER BY cat
-")
-DBI::dbExecute(con, "
-  CREATE OR REPLACE TABLE faers_case_psss AS
-  SELECT c.*, COALESCE(f.flag,0) AS flag_cni
-  FROM tmp_with_year_country c LEFT JOIN flag_cni f USING(case_key);
-")
-DBI::dbExecute(con, "
-  CREATE OR REPLACE TABLE faers_case_psss AS
-  SELECT c.*, COALESCE(m.flag,0) AS flag_mtor
-  FROM faers_case_psss c LEFT JOIN flag_mtor m USING(case_key);
-")
-DBI::dbExecute(con, "
-  CREATE OR REPLACE TABLE faers_case_psss AS
-  SELECT c.*, COALESCE(a.flag,0) AS flag_anti
-  FROM faers_case_psss c LEFT JOIN flag_anti a USING(case_key);
-")
-DBI::dbExecute(con, "
-  CREATE OR REPLACE TABLE faers_case_psss AS
-  SELECT c.*, COALESCE(s.flag,0) AS flag_cs
-  FROM faers_case_psss c LEFT JOIN flag_cs s USING(case_key);
-")
-DBI::dbExecute(con, "
-  CREATE OR REPLACE TABLE faers_case_psss AS
-  SELECT c.*, COALESCE(b.flag,0) AS flag_bio
-  FROM faers_case_psss c LEFT JOIN flag_bio b USING(case_key);
-")
-
-# QC
-DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM faers_case_psss")
-DBI::dbGetQuery(con, "SELECT SUM(flag_cni) cni, SUM(flag_mtor) mtor, SUM(flag_anti) anti, SUM(flag_cs) cs, SUM(flag_bio) bio FROM faers_case_psss")
-DBI::dbGetQuery(con, '
+  CREATE OR REPLACE VIEW tmp_drugs_psss AS
   SELECT
-    SUM(flag_cni)  AS "cni",
-    SUM(flag_mtor) AS "mtor",
-    SUM(flag_anti) AS "anti",
-    SUM(flag_cs)   AS "cs",
-    SUM(flag_bio)  AS "bio"
+    %1$s AS case_key,
+    %2$s AS drugname,
+    %3$s AS role_cod
+  FROM read_parquet('%4$s')
+  WHERE UPPER(COALESCE(%3$s,'')) IN ('PS','SS')
+", col_id, col_drugnm, col_role, norm_path(FAERS_FILE)))
+
+# 2) Build per-class flags (exists in PS/SS exposure)
+mk_flag_table <- function(tbl_name, keywords){
+  like_expr <- like_or_fun(keywords, col_expr = "UPPER(COALESCE(d.drugname,''))")
+  sql <- sprintf("
+    CREATE OR REPLACE TABLE %s AS
+    SELECT DISTINCT c.case_key, 1 AS flag
+    FROM tmp_with_year_country c
+    WHERE EXISTS (
+      SELECT 1 FROM tmp_drugs_psss d
+      WHERE d.case_key = c.case_key AND (%s)
+    )", tbl_name, like_expr)
+  DBI::dbExecute(con, sql)
+}
+
+mk_flag_table("flag_cni",  toupper(drug_classes[["Calcineurin inhibitors"]]))
+mk_flag_table("flag_mtor", toupper(drug_classes[["mTOR inhibitors"]]))
+mk_flag_table("flag_anti", toupper(drug_classes[["Antiproliferative agents"]]))
+mk_flag_table("flag_cs",   toupper(drug_classes[["Corticosteroids"]]))
+mk_flag_table("flag_bio",  toupper(drug_classes[["Biologics"]]))
+
+# Join flags onto case table
+DBI::dbExecute(con, "
+  CREATE OR REPLACE TABLE faers_case_psss AS
+  SELECT c.*,
+         COALESCE(fc.flag,0) AS flag_cni,
+         COALESCE(fm.flag,0) AS flag_mtor,
+         COALESCE(fa.flag,0) AS flag_anti,
+         COALESCE(fs.flag,0) AS flag_cs,
+         COALESCE(fb.flag,0) AS flag_bio
+  FROM tmp_with_year_country c
+  LEFT JOIN flag_cni  fc USING(case_key)
+  LEFT JOIN flag_mtor fm USING(case_key)
+  LEFT JOIN flag_anti fa USING(case_key)
+  LEFT JOIN flag_cs   fs USING(case_key)
+  LEFT JOIN flag_bio  fb USING(case_key)
+")
+
+# QC counts (printed to console)
+print(DBI::dbGetQuery(con, "SELECT COUNT(*) AS n_cases FROM faers_case_psss"))
+print(DBI::dbGetQuery(con, "
+  SELECT SUM(flag_cni) cni, SUM(flag_mtor) mtor, SUM(flag_anti) anti,
+         SUM(flag_cs) cs,   SUM(flag_bio)  bio
   FROM faers_case_psss
-')
+"))
 
-# ===== B6. 年龄分布：双轨输出 =====
+# ------------------------------- AGE Summaries -------------------------------
 
-# 基础 WITH 子句：统一把 age_raw+age_cod 转成年龄（years）
-age_sql <- "
-  CASE
-    WHEN TRY_CAST(NULLIF(CAST(age_raw AS VARCHAR), '') AS DOUBLE) IS NULL THEN NULL
-    WHEN UPPER(COALESCE(age_cod,'')) IN ('','YR','YRS','YEAR','YEARS') 
-         THEN TRY_CAST(NULLIF(CAST(age_raw AS VARCHAR), '') AS DOUBLE)
-    WHEN UPPER(age_cod) IN ('MON','MONTH','MONTHS') 
-         THEN TRY_CAST(NULLIF(CAST(age_raw AS VARCHAR), '') AS DOUBLE)/12.0
-    WHEN UPPER(age_cod) IN ('WK','WEEK','WEEKS')   
-         THEN TRY_CAST(NULLIF(CAST(age_raw AS VARCHAR), '') AS DOUBLE)/52.0
-    WHEN UPPER(age_cod) IN ('DY','DAY','DAYS')     
-         THEN TRY_CAST(NULLIF(CAST(age_raw AS VARCHAR), '') AS DOUBLE)/365.25
-    WHEN UPPER(age_cod) IN ('DEC','DECADE')        
-         THEN TRY_CAST(NULLIF(CAST(age_raw AS VARCHAR), '') AS DOUBLE)*10.0
-    ELSE NULL
-  END
-"
+age_expr <- age_to_years_sql("age_raw","age_cod")
 
-# --- 表1：中位数 + IQR ---
+# Median (IQR)
 age_median <- DBI::dbGetQuery(con, sprintf("
   WITH base AS (
     SELECT %s AS age_years, flag_cni, flag_mtor, flag_anti, flag_cs, flag_bio
     FROM faers_case_psss
   )
   SELECT 'Calcineurin inhibitors' AS drug_category,
-         COUNT(age_years) AS N_nonmissing,
+         COUNT(age_years) AS n_nonmissing,
          quantile_cont(age_years,0.5)  AS median_age,
          quantile_cont(age_years,0.25) AS q1,
          quantile_cont(age_years,0.75) AS q3
-  FROM base WHERE flag_cni=1
+  FROM base WHERE flag_cni = 1
   UNION ALL
-  SELECT 'mTOR inhibitors', COUNT(age_years), quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_mtor=1
+  SELECT 'mTOR inhibitors', COUNT(age_years),
+         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
+  FROM base WHERE flag_mtor = 1
   UNION ALL
-  SELECT 'Antiproliferative agents', COUNT(age_years), quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_anti=1
+  SELECT 'Antiproliferative agents', COUNT(age_years),
+         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
+  FROM base WHERE flag_anti = 1
   UNION ALL
-  SELECT 'Corticosteroids', COUNT(age_years), quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_cs=1
+  SELECT 'Corticosteroids', COUNT(age_years),
+         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
+  FROM base WHERE flag_cs = 1
   UNION ALL
-  SELECT 'Biologics', COUNT(age_years), quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_bio=1
-", age_sql))
-data.table::fwrite(age_median, "D:/FAERS/Inhibitors/age_median_IQR_by_category_PS+SS.csv")
+  SELECT 'Biologics', COUNT(age_years),
+         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
+  FROM base WHERE flag_bio = 1
+", age_expr))
+write_csv(age_median, file.path(OUT_DIR, "age_median_IQR_by_category_PS+SS.csv"))
 
-# --- 表2：均值 ± SD ---
+# Mean (SD)
 age_mean <- DBI::dbGetQuery(con, sprintf("
   WITH base AS (
     SELECT %s AS age_years, flag_cni, flag_mtor, flag_anti, flag_cs, flag_bio
     FROM faers_case_psss
   )
   SELECT 'Calcineurin inhibitors' AS drug_category,
-         COUNT(age_years) AS N_nonmissing,
+         COUNT(age_years) AS n_nonmissing,
          avg(age_years)   AS mean_age,
          stddev_samp(age_years) AS sd_age
-  FROM base WHERE flag_cni=1
+  FROM base WHERE flag_cni = 1
   UNION ALL
   SELECT 'mTOR inhibitors', COUNT(age_years), avg(age_years), stddev_samp(age_years)
-  FROM base WHERE flag_mtor=1
+  FROM base WHERE flag_mtor = 1
   UNION ALL
   SELECT 'Antiproliferative agents', COUNT(age_years), avg(age_years), stddev_samp(age_years)
-  FROM base WHERE flag_anti=1
+  FROM base WHERE flag_anti = 1
   UNION ALL
   SELECT 'Corticosteroids', COUNT(age_years), avg(age_years), stddev_samp(age_years)
-  FROM base WHERE flag_cs=1
+  FROM base WHERE flag_cs = 1
   UNION ALL
   SELECT 'Biologics', COUNT(age_years), avg(age_years), stddev_samp(age_years)
-  FROM base WHERE flag_bio=1
-", age_sql))
-data.table::fwrite(age_mean, "D:/FAERS/Inhibitors/age_mean_SD_by_category_PS+SS.csv")
-
-#B7
-age_expr <- age_to_years_sql("age_raw","age_cod")
-
-age_stats_faers <- DBI::dbGetQuery(con, sprintf("
-  WITH base AS (
-    SELECT %s AS age_years, flag_cni, flag_mtor, flag_anti, flag_cs, flag_bio
-    FROM faers_case_psss
-  )
-  SELECT 'Calcineurin inhibitors' AS drug_category, COUNT(age_years) AS N_nonmissing,
-         quantile_cont(age_years,0.5)  AS median_age,
-         quantile_cont(age_years,0.25) AS q1,
-         quantile_cont(age_years,0.75) AS q3
-  FROM base WHERE flag_cni=1
-  UNION ALL
-  SELECT 'mTOR inhibitors', COUNT(age_years),
-         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_mtor=1
-  UNION ALL
-  SELECT 'Antiproliferative agents', COUNT(age_years),
-         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_anti=1
-  UNION ALL
-  SELECT 'Corticosteroids', COUNT(age_years),
-         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_cs=1
-  UNION ALL
-  SELECT 'Biologics', COUNT(age_years),
-         quantile_cont(age_years,0.5), quantile_cont(age_years,0.25), quantile_cont(age_years,0.75)
-  FROM base WHERE flag_bio=1
+  FROM base WHERE flag_bio = 1
 ", age_expr))
+write_csv(age_mean, file.path(OUT_DIR, "age_mean_SD_by_category_PS+SS.csv"))
 
-data.table::fwrite(age_stats_faers, "D:/FAERS/Inhibitors/age_stats_by_category_PS+SS.csv")
+# ------------------------------- Sex Distribution ----------------------------
 
-#B8
 sex_dist_faers <- DBI::dbGetQuery(con, "
   WITH sex_std AS (
     SELECT CASE
              WHEN UPPER(COALESCE(sex_raw,'')) IN ('F','FEMALE','2') THEN 'F'
              WHEN UPPER(COALESCE(sex_raw,'')) IN ('M','MALE','1')   THEN 'M'
-             ELSE 'Other' END AS sex3,
+             ELSE 'Other'
+           END AS sex3,
            flag_cni, flag_mtor, flag_anti, flag_cs, flag_bio
     FROM faers_case_psss
   )
-  SELECT 'Calcineurin inhibitors' AS drug_category, sex3, COUNT(*) n FROM sex_std WHERE flag_cni=1 GROUP BY sex3
-  UNION ALL SELECT 'mTOR inhibitors', sex3, COUNT(*) FROM sex_std WHERE flag_mtor=1 GROUP BY sex3
-  UNION ALL SELECT 'Antiproliferative agents', sex3, COUNT(*) FROM sex_std WHERE flag_anti=1 GROUP BY sex3
-  UNION ALL SELECT 'Corticosteroids', sex3, COUNT(*) FROM sex_std WHERE flag_cs=1 GROUP BY sex3
-  UNION ALL SELECT 'Biologics', sex3, COUNT(*) FROM sex_std WHERE flag_bio=1 GROUP BY sex3
+  SELECT 'Calcineurin inhibitors' AS drug_category, sex3, COUNT(*) n
+    FROM sex_std WHERE flag_cni=1 GROUP BY sex3
+  UNION ALL
+  SELECT 'mTOR inhibitors', sex3, COUNT(*) FROM sex_std WHERE flag_mtor=1 GROUP BY sex3
+  UNION ALL
+  SELECT 'Antiproliferative agents', sex3, COUNT(*) FROM sex_std WHERE flag_anti=1 GROUP BY sex3
+  UNION ALL
+  SELECT 'Corticosteroids', sex3, COUNT(*) FROM sex_std WHERE flag_cs=1 GROUP BY sex3
+  UNION ALL
+  SELECT 'Biologics', sex3, COUNT(*) FROM sex_std WHERE flag_bio=1 GROUP BY sex3
   ORDER BY drug_category, sex3
 ")
-data.table::fwrite(sex_dist_faers, "D:/FAERS/Inhibitors/sex_distribution_by_category_PS+SS.csv")
+write_csv(sex_dist_faers, file.path(OUT_DIR, "sex_distribution_by_category_PS+SS.csv"))
 
-#B9
+# ------------------------------ Country Distribution -------------------------
+
 country_dist_faers <- DBI::dbGetQuery(con, "
   SELECT 'Calcineurin inhibitors' AS drug_category, country_use, COUNT(*) case_count
-    FROM faers_case_psss WHERE flag_cni=1 AND country_use IS NOT NULL AND country_use<>'' GROUP BY country_use
-  UNION ALL SELECT 'mTOR inhibitors', country_use, COUNT(*) FROM faers_case_psss WHERE flag_mtor=1 AND country_use IS NOT NULL AND country_use<>'' GROUP BY country_use
-  UNION ALL SELECT 'Antiproliferative agents', country_use, COUNT(*) FROM faers_case_psss WHERE flag_anti=1 AND country_use IS NOT NULL AND country_use<>'' GROUP BY country_use
-  UNION ALL SELECT 'Corticosteroids', country_use, COUNT(*) FROM faers_case_psss WHERE flag_cs=1 AND country_use IS NOT NULL AND country_use<>'' GROUP BY country_use
-  UNION ALL SELECT 'Biologics', country_use, COUNT(*) FROM faers_case_psss WHERE flag_bio=1 AND country_use IS NOT NULL AND country_use<>'' GROUP BY country_use
+    FROM faers_case_psss
+    WHERE flag_cni=1 AND country_use IS NOT NULL AND country_use <> ''
+    GROUP BY country_use
+  UNION ALL
+  SELECT 'mTOR inhibitors', country_use, COUNT(*)
+    FROM faers_case_psss
+    WHERE flag_mtor=1 AND country_use IS NOT NULL AND country_use <> ''
+    GROUP BY country_use
+  UNION ALL
+  SELECT 'Antiproliferative agents', country_use, COUNT(*)
+    FROM faers_case_psss
+    WHERE flag_anti=1 AND country_use IS NOT NULL AND country_use <> ''
+    GROUP BY country_use
+  UNION ALL
+  SELECT 'Corticosteroids', country_use, COUNT(*)
+    FROM faers_case_psss
+    WHERE flag_cs=1 AND country_use IS NOT NULL AND country_use <> ''
+    GROUP BY country_use
+  UNION ALL
+  SELECT 'Biologics', country_use, COUNT(*)
+    FROM faers_case_psss
+    WHERE flag_bio=1 AND country_use IS NOT NULL AND country_use <> ''
+    GROUP BY country_use
   ORDER BY drug_category, case_count DESC
 ")
-data.table::fwrite(country_dist_faers, "D:/FAERS/Inhibitors/country_distribution_by_category_PS+SS.csv")
+write_csv(country_dist_faers, file.path(OUT_DIR, "country_distribution_by_category_PS+SS.csv"))
+
+# ------------------------------ Annual Trend (Case) --------------------------
+
+# Annual trend: number of unique cases by year and drug class
+# Implemented by counting cases with flag==1 per class
+annual_list <- list(
+  "Calcineurin inhibitors" = "flag_cni",
+  "mTOR inhibitors"        = "flag_mtor",
+  "Antiproliferative agents" = "flag_anti",
+  "Corticosteroids"        = "flag_cs",
+  "Biologics"              = "flag_bio"
+)
+
+annual_dt <- rbindlist(lapply(names(annual_list), function(k){
+  flag_var <- annual_list[[k]]
+  sql <- sprintf("
+    SELECT year, '%s' AS drug_category, COUNT(*) AS case_count
+    FROM faers_case_psss
+    WHERE %s = 1 AND year IS NOT NULL
+    GROUP BY year
+    ORDER BY year
+  ", k, flag_var)
+  as.data.table(DBI::dbGetQuery(con, sql))
+}), use.names = TRUE, fill = TRUE)
+
+setorder(annual_dt, year, drug_category)
+write_csv(annual_dt, file.path(OUT_DIR, "annual_trend_by_category_PS+SS.csv"))
+
+# ------------------------------- Session / Footers ---------------------------
+
+message("Analysis complete. Outputs written to: ", normalizePath(OUT_DIR, winslash = "/"))
+print(sessionInfo())
+
+# Graceful disconnect
+try(DBI::dbDisconnect(con, shutdown = TRUE), silent = TRUE)
