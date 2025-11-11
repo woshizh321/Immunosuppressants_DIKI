@@ -1,0 +1,262 @@
+# ============================================================
+# 04_LASSO_mainline.R
+# Core computation workflow for LASSO logistic model
+# (No visualization included)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(glmnet)
+  library(Matrix)
+  library(pROC)
+  library(PRROC)
+  library(broom)
+  library(sandwich)
+  library(lmtest)
+  library(ResourceSelection)
+})
+
+# ---------------------------- CONFIG ----------------------------
+SEED        <- 20251111
+DATA_PATH   <- "D:/FAERS/Inhibitors"
+OUT_MAIN    <- file.path(DATA_PATH, "Derived")
+OUT_PATH    <- file.path(OUT_MAIN, "LASSO_path")
+dir.create(OUT_MAIN, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_PATH, showWarnings = FALSE, recursive = TRUE)
+
+# === Input data description ===
+# Expected file: data_for_lasso.csv containing
+#   y: binary outcome (0/1, e.g., DIKI)
+#   id: optional ID column
+#   other columns: candidate predictors (numeric / dummy / categorical)
+DATA_FILE   <- file.path(DATA_PATH, "data_for_lasso.csv")
+TARGET_COL  <- "y"
+ID_COL      <- "id"
+# Regular expression to detect time-related variables (optional)
+TIME_REGEX  <- "(year|quarter|period|report|tto|^time_)"
+
+# Cross-validation and model parameters
+K_FOLDS     <- 10
+FAMILY      <- "binomial"
+ALPHA       <- 1      # L1 penalty
+N_LAMBDA    <- 100
+CAL_BINS    <- 10     # For calibration bins in Hosmer-Lemeshow
+
+# ------------------------- UTILITIES ----------------------------
+num_col <- function(x) suppressWarnings(as.numeric(x))
+
+# Convert a data.table into sparse model matrix + response
+to_sparse_model_matrix <- function(dt, y_col, drop_cols = NULL) {
+  stopifnot(y_col %in% names(dt))
+  if (!is.null(drop_cols)) dt <- copy(dt)[, (drop_cols) := NULL, with = FALSE]
+  y <- as.integer(dt[[y_col]])
+  dt[[y_col]] <- NULL
+  # Convert characters/factors to dummy variables
+  for (nm in names(dt)) {
+    if (is.character(dt[[nm]]) || is.factor(dt[[nm]])) {
+      dt[[nm]] <- as.factor(dt[[nm]])
+    }
+  }
+  mm <- sparse.model.matrix(~ . - 1, data = dt)
+  list(X = mm, y = y, feat_names = colnames(mm))
+}
+
+# Extract CV lambda summary
+cv_lambda_summary <- function(cvfit) {
+  data.table(lambda = cvfit$lambda, cvm = cvfit$cvm, cvsd = cvfit$cvsd)
+}
+
+# Export full coefficient paths and coefficients at λ_min / λ_1SE
+coef_paths_export <- function(cvfit, feat_names, out_prefix) {
+  betas <- as.matrix(cvfit$glmnet.fit$beta)
+  lambdas <- cvfit$glmnet.fit$lambda
+  stopifnot(ncol(betas) == length(lambdas))
+  dt_path <- data.table(
+    feature    = rep(feat_names, times = length(lambdas)),
+    lambda     = rep(lambdas, each = length(feat_names)),
+    log_lambda = rep(log(lambdas), each = length(feat_names)),
+    coef       = as.vector(betas)
+  )
+  fwrite(dt_path, file.path(OUT_PATH, sprintf("coef_paths_%s.csv", out_prefix)))
+
+  # Non-zero coefficients at λ_min and λ_1se
+  for (s in c("lambda.min", "lambda.1se")) {
+    b <- as.matrix(coef(cvfit, s = s))
+    terms <- rownames(b)
+    dt <- data.table(term = terms, coef = as.numeric(b))
+    dt <- dt[term != "(Intercept)"]
+    fwrite(dt, file.path(OUT_PATH, sprintf("coef_at_%s_%s.csv",
+                                           sub("\\.", "_", s), out_prefix)))
+  }
+}
+
+# K-fold out-of-fold predictions
+kfold_oof_predict <- function(X, y, k = 10, seed = 1, alpha = 1, family = "binomial") {
+  set.seed(seed)
+  n <- length(y)
+  folds <- sample(rep(1:k, length.out = n))
+  oof <- data.table(id = seq_len(n), fold = folds, y = y, p_hat = NA_real_)
+  aucs <- numeric(k)
+  for (i in 1:k) {
+    tr_idx <- which(folds != i)
+    te_idx <- which(folds == i)
+    cvfit <- cv.glmnet(
+      x = X[tr_idx, ], y = y[tr_idx],
+      family = family, alpha = alpha,
+      type.measure = "deviance", nlambda = N_LAMBDA
+    )
+    ph <- as.numeric(predict(cvfit, newx = X[te_idx, ], s = "lambda.1se", type = "response"))
+    oof$p_hat[te_idx] <- ph
+    aucs[i] <- as.numeric(auc(roc(y[te_idx], ph, quiet = TRUE, direction = "<")))
+  }
+  list(oof = oof, fold_auc = aucs, mean_auc = mean(aucs, na.rm = TRUE))
+}
+
+# Brier score
+brier_score <- function(y, p) mean((p - y)^2, na.rm = TRUE)
+
+# Hosmer-Lemeshow goodness-of-fit test
+hl_test_result <- function(y, p, g = 10) {
+  suppressWarnings(capture.output({
+    ht <- hoslem.test(y, p, g = g)
+  }))
+  data.table(statistic = unname(ht$statistic), df = unname(ht$parameter), p_value = ht$p.value)
+}
+
+# Calibration table for plotting
+calibration_table <- function(y, p, bins = 10) {
+  dt <- data.table(y = y, p = p)
+  dt <- dt[is.finite(y) & is.finite(p)]
+  dt[, bin := cut(p, breaks = quantile(p, probs = seq(0, 1, length.out = bins + 1),
+                                       na.rm = TRUE), include.lowest = TRUE, dig.lab = 6)]
+  dt[, .(n = .N, mean_pred = mean(p), obs_rate = mean(y), sd_pred = sd(p)), by = bin]
+}
+
+# Decision curve analysis (net benefit)
+decision_curve_table <- function(y, p, thresholds = seq(0.01, 0.99, by = 0.01)) {
+  dt <- data.table(y = y, p = p)
+  N  <- nrow(dt)
+  rbindlist(lapply(thresholds, function(pt) {
+    pred_pos <- as.integer(dt$p >= pt)
+    TP <- sum(pred_pos == 1 & dt$y == 1)
+    FP <- sum(pred_pos == 1 & dt$y == 0)
+    NB <- TP / N - FP / N * (pt / (1 - pt))
+    data.table(threshold = pt, net_benefit = NB)
+  }))
+}
+
+# SHAP-like global feature importance (|β_j * x_ij|)
+shap_like_global_importance <- function(X, feat_names, coef_vec) {
+  stopifnot(length(coef_vec) == length(feat_names))
+  contrib_mean <- numeric(length(feat_names))
+  for (j in seq_along(feat_names)) {
+    xj <- X[, j]
+    bj <- coef_vec[j]
+    contrib_mean[j] <- mean(abs(as.numeric(xj) * bj))
+  }
+  data.table(feature = feat_names, shap_value = contrib_mean)
+}
+
+# ---------------------- LOAD DATA -----------------------------
+stopifnot(file.exists(DATA_FILE))
+raw <- fread(DATA_FILE)
+stopifnot(TARGET_COL %in% names(raw))
+if (!(ID_COL %in% names(raw))) raw[, (ID_COL) := .I]
+
+set.seed(SEED)
+prep <- to_sparse_model_matrix(raw, y_col = TARGET_COL, drop_cols = ID_COL)
+X <- prep$X; y <- prep$y; FEATS <- prep$feat_names
+
+# ---------------------- LASSO CV FIT ---------------------------
+set.seed(SEED)
+cvfit <- cv.glmnet(
+  x = X, y = y, family = FAMILY, alpha = ALPHA,
+  type.measure = "deviance", nlambda = N_LAMBDA
+)
+
+# Export CV curve and coefficient paths
+cv_curve <- cv_lambda_summary(cvfit)
+fwrite(cv_curve, file.path(DATA_PATH, "lasso_druglevel_cv_curve.csv"))
+coef_paths_export(cvfit, FEATS, out_prefix = "lasso_druglevel_cvfit")
+
+# ---------------------- OOF PERFORMANCE ------------------------
+oof <- kfold_oof_predict(X, y, k = K_FOLDS, seed = SEED, alpha = ALPHA, family = FAMILY)
+fwrite(oof$oof, file.path(DATA_PATH, "cv_oof_predictions.csv"))
+fwrite(data.table(fold = 1:K_FOLDS, AUC = oof$fold_auc, mean_AUC = oof$mean_auc),
+       file.path(OUT_MAIN, "OOF_auc_summary.csv"))
+
+# Brier, HL, Calibration, PR, DCA
+fwrite(data.table(Brier = brier_score(oof$oof$y, oof$oof$p_hat)),
+       file.path(OUT_MAIN, "brier_score.csv"))
+fwrite(hl_test_result(oof$oof$y, oof$oof$p_hat, g = CAL_BINS),
+       file.path(OUT_MAIN, "hl_test.csv"))
+fwrite(calibration_table(oof$oof$y, oof$oof$p_hat, bins = CAL_BINS),
+       file.path(OUT_MAIN, "calibration_table.csv"))
+pr <- PRROC::pr.curve(scores.class0 = oof$oof$p_hat[oof$oof$y == 1],
+                      scores.class1 = oof$oof$p_hat[oof$oof$y == 0])
+fwrite(data.table(AUPRC = pr$auc.integral), file.path(OUT_MAIN, "auprc.csv"))
+fwrite(decision_curve_table(oof$oof$y, oof$oof$p_hat),
+       file.path(OUT_MAIN, "dca_table.csv"))
+
+# ---------------------- SHAP-LIKE IMPORTANCE ------------------
+b_1se <- as.matrix(coef(cvfit, s = "lambda.1se"))
+b_1se <- b_1se[rownames(b_1se) != "(Intercept)", , drop = FALSE]
+coef_vec <- as.numeric(b_1se)
+names(coef_vec) <- rownames(b_1se)
+idx <- match(FEATS, names(coef_vec))
+keep <- which(!is.na(idx))
+imp <- shap_like_global_importance(X[, keep], FEATS[keep], coef_vec[idx[keep]])
+imp[, beta := coef_vec[idx[keep]]]
+imp[, OR := exp(beta)]
+fwrite(imp, file.path(DATA_PATH, "lasso_shap_like_importance.csv"))
+
+# ---------------------- REFIT (Standard + Robust) -------------
+sel <- names(coef_vec)[abs(coef_vec) > 0]
+if (length(sel) == 0) stop("No non-zero features at lambda.1se.")
+df_refit <- as.data.frame(as.matrix(X[, sel]))
+df_refit[[TARGET_COL]] <- y
+form <- as.formula(paste(TARGET_COL, "~", paste(sel, collapse = " + ")))
+
+# Standard logistic refit
+fit_std <- glm(form, data = df_refit, family = binomial(link = "logit"))
+tidy_std <- tidy(fit_std, conf.int = TRUE, exponentiate = TRUE)
+std_out <- tidy_std[, c("term","estimate","conf.low","conf.high","p.value")]
+setDT(std_out)
+setnames(std_out, c("estimate","conf.low","conf.high","p.value"),
+                 c("OR","CI_low","CI_high","p_value"))
+fwrite(std_out, file.path(DATA_PATH, "lasso_refit_logistic_results.csv"))
+
+tab3 <- std_out[, .(Variable = term,
+                    Group = NA_character_,
+                    `Adjusted OR (95% CI)` = sprintf("%.2f [%.2f–%.2f]", OR, CI_low, CI_high),
+                    `p value` = sprintf("%.3g", p_value))]
+fwrite(tab3, file.path(DATA_PATH, "Table3_Refit_Logistic_OR_95CI.csv"))
+
+# Robust refit (sandwich covariance)
+vc <- sandwich::vcovHC(fit_std, type = "HC0")
+ct <- lmtest::coeftest(fit_std, vcov = vc)
+rb <- data.table(term = rownames(ct),
+                 beta = ct[, "Estimate"],
+                 se   = ct[, "Std. Error"],
+                 z    = ct[, "z value"],
+                 p_value = ct[, "Pr(>|z|)"])
+rb[, `:=`(OR = exp(beta),
+          CI_low  = exp(beta - 1.96 * se),
+          CI_high = exp(beta + 1.96 * se))]
+rb <- rb[term != "(Intercept)"]
+fwrite(rb, file.path(DATA_PATH, "lasso_refit_logistic_robust.csv"))
+
+# ---------------------- OPTIONAL: TIME-EXTENDED MODEL ---------
+has_time <- any(grepl(TIME_REGEX, FEATS, ignore.case = TRUE))
+if (has_time) {
+  set.seed(SEED)
+  cvfit_time <- cv.glmnet(
+    x = X, y = y, family = FAMILY, alpha = ALPHA,
+    type.measure = "deviance", nlambda = N_LAMBDA
+  )
+  coef_paths_export(cvfit_time, FEATS, out_prefix = "lasso_druglevel_time_cvfit")
+}
+
+# ---------------------- DONE ----------------------------------
+message("LASSO mainline computation finished.")
+message("Outputs written to: ", OUT_MAIN, " and ", OUT_PATH)
