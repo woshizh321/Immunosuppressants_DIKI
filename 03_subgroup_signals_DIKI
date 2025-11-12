@@ -522,6 +522,198 @@ res_ser_fin <- finalize_and_write(res_ser_fin,
                                   file.path(OUT_DIR, "Signals_DIKI_bySerious_byDrug.csv"),
                                   subgroup_col = "serious_grp",
                                   subgroup_levels = c("Serious","Non-serious"))
+# --------------------------- 6) TTO ------------------------------
+suppressPackageStartupMessages({
+  library(DBI); library(duckdb); library(data.table)
+})
+
+FAERS_FILE <- "D:/FAERS/MASTER/FAERS_MASTER_FILE_2004-2024_with_TTO_ALL.parquet"
+DIKI_PT_CSV <- "D:/FAERS/MASTER/diki_pt_v28.0_final.csv"
+OUT_DIR <- "D:/FAERS/Inhibitors"; if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, TRUE)
+
+# ---- DuckDB connection (read-only parquet; temp DB is fine) ----
+con <- dbConnect(duckdb::duckdb(), dbdir=":memory:", read_only=TRUE)
+DBI::dbExecute(con, "PRAGMA threads=4;")
+DBI::dbExecute(con, "PRAGMA memory_limit='8GB';")
+DBI::dbExecute(con, "PRAGMA temp_directory='D:/duck_tmp';")
+
+norm_path <- function(p) gsub("\\\\", "/", p)
+
+# ==== 1) Base view: map your actual columns ====
+# We prefer TTO computed on PS+SS pairs; fallback to *_ps then *_any if needed.
+DBI::dbExecute(con, sprintf("
+  CREATE OR REPLACE VIEW base_raw AS
+  SELECT
+    primaryid,
+    UPPER(COALESCE(drugname_u,''))   AS drugname_std,
+    UPPER(COALESCE(role_cod_u,''))   AS role_cod_std,
+    UPPER(COALESCE(pt_u,''))         AS pt_std,
+    meddra_pt_code                   AS pt_code,
+    /* choose TTO in priority: psss -> ps -> any */
+    COALESCE(tto_onset_days_psss,
+             tto_onset_days_ps,
+             tto_onset_days_any)     AS tto_days
+  FROM read_parquet('%s')
+", norm_path(FAERS_FILE)))
+DBI::dbGetQuery(con, "
+  SELECT 
+    SUM(flag_cni)  AS cni,
+    SUM(flag_mtor) AS mtor,
+    SUM(flag_anti) AS anti_n,
+    SUM(flag_cs)   AS cs,
+    SUM(flag_bio)  AS bio,
+    COUNT(*)       AS n
+  FROM exposure_by_case;
+")
+# Quick check
+print(DBI::dbGetQuery(con, "SELECT * FROM base_raw LIMIT 5"))
+
+# ==== 2) DIKI PT list (join by code or PT name) ====
+# Expecting CSV to have columns like: pt_code / pt / etc. We'll normalize.
+diki <- fread(DIKI_PT_CSV)
+# Standardize helper columns
+if (!'pt_code' %in% names(diki)) {
+  # try to find a code-like column
+  cand <- grep("code|pt_code|meddra", names(diki), ignore.case=TRUE, value=TRUE)
+  if (length(cand)) setnames(diki, cand[1], "pt_code")
+}
+if (!'pt' %in% names(diki)) {
+  cand <- grep("pt$|pt_name|preferred", names(diki), ignore.case=TRUE, value=TRUE)
+  if (length(cand)) setnames(diki, cand[1], "pt")
+}
+if ("pt" %in% names(diki)) diki[, pt_upper := toupper(trimws(pt))]
+if (!"pt_code" %in% names(diki)) diki[, pt_code := NA_integer_]
+
+# Register into DuckDB as temp table
+DBI::dbWriteTable(con, "diki_ptlist_tmp", diki, temporary = TRUE, overwrite = TRUE)
+
+# Build unified DIKI lookup with both code and name (where available)
+DBI::dbExecute(con, "
+  CREATE OR REPLACE VIEW diki_lookup AS
+  SELECT DISTINCT
+    CAST(pt_code AS BIGINT) AS pt_code_norm,
+    UPPER(COALESCE(pt_upper,'')) AS pt_upper_norm
+  FROM diki_ptlist_tmp
+")
+
+# ==== 3) Attach DIKI flag to rows (prefer code match; fallback name) ====
+DBI::dbExecute(con, "
+  CREATE OR REPLACE VIEW base_with_diki AS
+  WITH by_code AS (
+    SELECT b.*, CASE WHEN dl.pt_code_norm IS NOT NULL THEN 1 ELSE 0 END AS is_diki_by_code
+    FROM base_raw b
+    LEFT JOIN diki_lookup dl
+      ON b.pt_code = dl.pt_code_norm
+  ),
+  final AS (
+    SELECT bc.*,
+           CASE
+             WHEN is_diki_by_code = 1 THEN 1
+             WHEN dl2.pt_upper_norm IS NOT NULL THEN 1
+             ELSE 0
+           END AS flag_diki
+    FROM by_code bc
+    LEFT JOIN diki_lookup dl2
+      ON bc.pt_std = dl2.pt_upper_norm
+  )
+  SELECT * FROM final
+")
+
+# QC: how many DIKI
+print(DBI::dbGetQuery(con, "SELECT SUM(flag_diki) AS n_diki, COUNT(*) AS n_all FROM base_with_diki"))
+
+# ==== 4) Restrict to PS/SS drug roles and build exposures (CNI/mTOR/Anti/CS/Bio) ====
+DBI::dbExecute(con, "CREATE OR REPLACE VIEW psss_rows AS
+  SELECT primaryid, drugname_std, role_cod_std, tto_days, flag_diki
+  FROM base_with_diki
+  WHERE role_cod_std IN ('PS','SS')
+")
+
+# Dictionaries (can extend as needed)
+CNI  <- c('TACROLIMUS','FK506','PROGRAF','ADVAGRAF','CYCLOSPORINE','NEORAL','SANDIMMUNE')
+MTOR <- c('EVEROLIMUS','AFINITOR','CERTICAN','SIROLIMUS','RAPAMUNE','TEMSIROLIMUS','TORISEL')
+ANTI <- c('MYCOPHENOLATE MOFETIL','CELLCEPT','MYCOPHENOLIC ACID','MYFORTIC','AZATHIOPRINE','IMURAN')
+CS   <- c('PREDNISONE','DELTASONE','METHYLPREDNISOLONE','MEDROL','SOLU-MEDROL','DEXAMETHASONE','DECADRON','PREDNISOLONE')
+BIO  <- c('RITUXIMAB','MABTHERA','RITUXAN','BASILIXIMAB','SIMULECT','BELATACEPT','NULOJIX')
+
+like_or <- function(vec, col="drugname_std") paste(sprintf("%s LIKE '%%%s%%'", col, gsub("'", "''", vec)), collapse=" OR ")
+
+DBI::dbExecute(con, sprintf("
+  CREATE OR REPLACE VIEW exposure_by_case AS
+  SELECT
+    primaryid,
+    MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS flag_cni,
+    MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS flag_mtor,
+    MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS flag_anti,
+    MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS flag_cs,
+    MAX(CASE WHEN %s THEN 1 ELSE 0 END) AS flag_bio,
+    ANY_VALUE(tto_days) AS tto_days,
+    MAX(flag_diki) AS flag_diki
+  FROM psss_rows
+  GROUP BY primaryid
+",
+                            like_or(CNI), like_or(MTOR), like_or(ANTI), like_or(CS), like_or(BIO)
+))
+
+DBI::dbGetQuery(con, "
+  SELECT 
+    SUM(flag_cni)  AS cni,
+    SUM(flag_mtor) AS mtor,
+    SUM(flag_anti) AS anti_n,
+    SUM(flag_cs)   AS cs,
+    SUM(flag_bio)  AS bio,
+    COUNT(*)       AS n
+  FROM exposure_by_case;
+")
+
+
+# ==== 5) TTO bins ====
+DBI::dbExecute(con, "
+  CREATE OR REPLACE VIEW exposure_tto AS
+  SELECT *,
+         CASE
+           WHEN tto_days IS NULL THEN 'Missing'
+           WHEN tto_days <= 7   THEN '0-7d'
+           WHEN tto_days <= 30  THEN '8-30d'
+           WHEN tto_days <= 90  THEN '31-90d'
+           WHEN tto_days <= 365 THEN '91-365d'
+           ELSE '>365d'
+         END AS tto_bin
+  FROM exposure_by_case
+")
+
+print(DBI::dbGetQuery(con, "SELECT tto_bin, COUNT(*) n FROM exposure_tto GROUP BY tto_bin ORDER BY n DESC"))
+
+# ==== 6) Class × TTO table  ====
+sql_summary <- "
+  WITH labeled AS (
+    SELECT
+      CASE
+        WHEN flag_cni = 1  THEN 'Calcineurin inhibitors'
+        WHEN flag_mtor = 1 THEN 'mTOR inhibitors'
+        WHEN flag_anti = 1 THEN 'Antiproliferative agents'
+        WHEN flag_cs = 1   THEN 'Corticosteroids'
+        WHEN flag_bio = 1  THEN 'Biologics'
+        ELSE NULL
+      END AS drug_category,
+      tto_bin, flag_diki
+    FROM exposure_tto
+  )
+  SELECT drug_category, tto_bin,
+         COUNT(*) AS total_reports,
+         SUM(flag_diki) AS diki_cases,
+         ROUND(100.0 * SUM(flag_diki)/NULLIF(COUNT(*),0), 2) AS diki_rate_pct
+  FROM labeled
+  WHERE drug_category IS NOT NULL
+  GROUP BY 1,2
+  ORDER BY drug_category, tto_bin
+"
+tto_summary <- DBI::dbGetQuery(con, sql_summary)
+fwrite(tto_summary, file.path(OUT_DIR, "TTO_Distribution_by_DrugCategory.csv"))
+
+print(head(tto_summary, 10))
+dbDisconnect(con)
+cat("\nSaved: ", file.path(OUT_DIR, "TTO_Distribution_by_DrugCategory.csv"), "\n")
 
 # ------------------------------- Wrap up -------------------------------------
 try(DBI::dbDisconnect(con, shutdown = TRUE), silent = TRUE)
